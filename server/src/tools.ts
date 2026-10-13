@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import type { Stats } from "node:fs";
 import { mkdir, open, readFile, realpath, stat, writeFile } from "node:fs/promises";
@@ -73,6 +74,8 @@ interface ScreenshotExport {
   base64: string;
   width: number;
   height: number;
+  pixelWidth?: number;
+  pixelHeight?: number;
 }
 
 interface SaveScreenshotItemInput {
@@ -91,6 +94,9 @@ interface SaveScreenshotItemResult {
   format?: ExportFormat;
   width?: number;
   height?: number;
+  pixelWidth?: number;
+  pixelHeight?: number;
+  sha256?: string;
   bytesWritten?: number;
   success: boolean;
   error?: string;
@@ -213,15 +219,11 @@ export function registerTools(server: McpServer, node: Node, port: number): void
 
   server.tool(
     "get_design_context",
-    "Get the design context for the current selection or page. Returns a summarized tree structure optimized for understanding the current design context. Works in both Figma and FigJam. When multiple files are connected, specify fileKey.",
+    "Read precise design data for a node or selection: source measurements, per-side borders, text ranges, CSS, consumer-resolved variables, component documentation, and asset candidates. Reports truncation and unavailable fields. Use save_screenshots to export PNG references or SVG assets; save_image for original image fills. Does not generate application code. When multiple files are connected, specify fileKey.",
     toolInputSchemas.get_design_context.shape,
-    async ({ depth, fileKey }): Promise<ToolResult> => {
-      const params: Record<string, unknown> = {};
-      if (depth !== undefined && depth > 0) {
-        params.depth = depth;
-      }
+    async ({ fileKey, nodeId, ...params }): Promise<ToolResult> => {
       return renderResponse(() =>
-        node.sendWithParams("get_design_context", undefined, params, fileKey)
+        node.sendWithParams("get_precision_context", nodeId ? [nodeId] : undefined, params, fileKey)
       );
     }
   );
@@ -232,6 +234,41 @@ export function registerTools(server: McpServer, node: Node, port: number): void
     toolInputSchemas.get_variable_defs.shape,
     async ({ fileKey }): Promise<ToolResult> => {
       return renderResponse(() => node.send("get_variable_defs", undefined, fileKey));
+    }
+  );
+
+  server.tool(
+    "save_image",
+    "Save original image-fill bytes by imageHash. Returns local path, dimensions, SHA-256 and byte count. For rendered crop, effects or SVG use save_screenshots. Does not overwrite files.",
+    toolInputSchemas.save_image.shape,
+    async ({ imageHash, outputPath, fileKey }): Promise<ToolResult> => {
+      try {
+        const target = resolveAndValidateOutputPath(outputPath, process.cwd());
+        const response = await node.sendWithParams("get_image", undefined, { imageHash }, fileKey);
+        if (response.error) throw new Error(response.error);
+        const data = response.data as { base64: string; width: number; height: number };
+        if (!data || typeof data.base64 !== "string") throw new Error("Malformed image response");
+        const bytesWritten = await writeBase64ToFile(data.base64, target);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                outputPath: target,
+                imageHash,
+                width: data.width,
+                height: data.height,
+                bytesWritten,
+                sha256: createHash("sha256")
+                  .update(Buffer.from(data.base64, "base64"))
+                  .digest("hex"),
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        return { isError: true, content: [{ type: "text", text: String(error) }] };
+      }
     }
   );
 
@@ -1429,6 +1466,11 @@ async function saveScreenshotItemToFile(
       format: resolvedFormat,
       width: screenshotExport.width,
       height: screenshotExport.height,
+      pixelWidth: screenshotExport.pixelWidth,
+      pixelHeight: screenshotExport.pixelHeight,
+      sha256: createHash("sha256")
+        .update(Buffer.from(screenshotExport.base64, "base64"))
+        .digest("hex"),
       bytesWritten,
       success: true,
     };
@@ -1450,7 +1492,12 @@ async function saveScreenshotItemToFile(
  * @returns Number of bytes written.
  */
 async function writeBase64ToFile(base64: string, outputPath: string): Promise<number> {
+  if (base64.length > 44_739_244) throw new Error("Export exceeds the 32 MiB transfer limit");
+  if (!base64 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64))
+    throw new Error("Invalid or empty base64 export");
   const bytes = Buffer.from(base64, "base64");
+  if (!bytes.length || bytes.length > 32 * 1024 * 1024)
+    throw new Error("Export size must be 1 byte to 32 MiB");
   await mkdir(path.dirname(outputPath), { recursive: true });
   try {
     await writeFile(outputPath, bytes, { flag: "wx" });

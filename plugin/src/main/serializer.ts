@@ -2,6 +2,7 @@
 type SerializedSolidPaint = {
   type: "SOLID";
   color: string;
+  colorRGB?: RGB;
   opacity?: number;
 };
 
@@ -54,6 +55,9 @@ type SerializedAutoLayout = {
 
 // --- Serialized styles ---
 type SerializedStyles = {
+  strokeWeights?: { top: number; right: number; bottom: number; left: number };
+  layout?: Record<string, unknown>;
+  rawEffects?: unknown;
   opacity?: number;
   blendMode?: string;
   visible?: boolean;
@@ -94,6 +98,27 @@ type SerializedNode = {
   styles?: SerializedStyles;
   children?: SerializedNode[];
   childCount?: number;
+  details?: Record<string, unknown>;
+  textSegments?: unknown[];
+  warnings?: string[];
+};
+
+// Figma's mixed sentinel is a Symbol, which JSON.stringify silently drops.
+export const jsonValue = (value: unknown): unknown => {
+  if (typeof value === "symbol") return "mixed";
+  if (Array.isArray(value)) return value.map(jsonValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, jsonValue(v)]));
+  }
+  return value;
+};
+
+const properties = (node: object, names: string[]): Record<string, unknown> => {
+  const result: Record<string, unknown> = {};
+  for (const name of names) {
+    if (name in node) result[name] = jsonValue((node as Record<string, unknown>)[name]);
+  }
+  return result;
 };
 
 const isMixed = (value: unknown): value is symbol => typeof value === "symbol";
@@ -128,6 +153,8 @@ const serializePaints = (
             {
               type: "SOLID",
               color: toHex(paint.color),
+              ...properties(paint, ["boundVariables", "blendMode"]),
+              colorRGB: paint.color,
               opacity: paint.opacity,
             },
           ];
@@ -138,6 +165,7 @@ const serializePaints = (
           return [
             {
               type: paint.type,
+              ...properties(paint, ["boundVariables", "blendMode"]),
               gradientStops: serializeGradientStops(paint.gradientStops),
               gradientTransform: paint.gradientTransform,
               opacity: paint.opacity,
@@ -147,6 +175,7 @@ const serializePaints = (
           return [
             {
               type: "IMAGE",
+              ...properties(paint, ["filters", "rotation", "scalingFactor", "blendMode"]),
               scaleMode: paint.scaleMode,
               imageHash: paint.imageHash,
               imageTransform: paint.imageTransform,
@@ -220,8 +249,50 @@ const serializeText = (node: TextNode, base: SerializedNode) => {
     fontFamily = node.fontName.family;
     fontStyle = node.fontName.style;
   }
+  let textSegments: unknown[] = [];
+  const warnings: string[] = [];
+  try {
+    textSegments = node
+      .getStyledTextSegments([
+        "fontName",
+        "fontSize",
+        "fontWeight",
+        "fills",
+        "textDecoration",
+        "textCase",
+        "lineHeight",
+        "letterSpacing",
+        "textStyleId",
+        "fillStyleId",
+        "hyperlink",
+        "listOptions",
+        "indentation",
+        "paragraphIndent",
+        "paragraphSpacing",
+        "boundVariables",
+      ])
+      .map((segment) => ({
+        ...(jsonValue(segment) as object),
+        fills: serializePaints(segment.fills),
+        // Keep the source units; CSS pixel conversions are supplemental only.
+        letterSpacingPx:
+          segment.letterSpacing.unit === "PERCENT"
+            ? (segment.fontSize * segment.letterSpacing.value) / 100
+            : segment.letterSpacing.value,
+        lineHeightPx:
+          segment.lineHeight.unit === "AUTO"
+            ? undefined
+            : segment.lineHeight.unit === "PERCENT"
+              ? (segment.fontSize * segment.lineHeight.value) / 100
+              : segment.lineHeight.value,
+      }));
+  } catch (error) {
+    warnings.push(`Text segments unavailable: ${String(error)}`);
+  }
   return {
     ...base,
+    textSegments,
+    ...(warnings.length ? { warnings } : {}),
     characters: node.characters,
     styles: {
       ...base.styles,
@@ -235,6 +306,17 @@ const serializeText = (node: TextNode, base: SerializedNode) => {
       textAlignHorizontal: isMixed(node.textAlignHorizontal) ? "mixed" : node.textAlignHorizontal,
       textAlignVertical: isMixed(node.textAlignVertical) ? "mixed" : node.textAlignVertical,
       textAutoResize: node.textAutoResize,
+      ...properties(node, [
+        "paragraphIndent",
+        "paragraphSpacing",
+        "listSpacing",
+        "textCase",
+        "textTruncation",
+        "maxLines",
+        "hangingPunctuation",
+        "hangingList",
+        "hasMissingFont",
+      ]),
     },
   };
 };
@@ -261,6 +343,37 @@ const serializeStyles = (node: SerializableNode): SerializedStyles => {
   if ("strokeWeight" in node) {
     styles.strokeWeight = isMixed(node.strokeWeight) ? "mixed" : (node.strokeWeight as number);
   }
+  if ("strokeTopWeight" in node) {
+    styles.strokeWeights = {
+      top: node.strokeTopWeight,
+      right: node.strokeRightWeight,
+      bottom: node.strokeBottomWeight,
+      left: node.strokeLeftWeight,
+    };
+  }
+  styles.layout = properties(node, [
+    "layoutAlign",
+    "layoutGrow",
+    "layoutPositioning",
+    "layoutSizingHorizontal",
+    "layoutSizingVertical",
+    "minWidth",
+    "maxWidth",
+    "minHeight",
+    "maxHeight",
+    "strokesIncludedInLayout",
+    "itemReverseZIndex",
+    "gridRowCount",
+    "gridColumnCount",
+    "gridRowGap",
+    "gridColumnGap",
+    "gridRowSizes",
+    "gridColumnSizes",
+    "gridRowSpan",
+    "gridColumnSpan",
+    "gridChildHorizontalAlign",
+    "gridChildVerticalAlign",
+  ]);
   if ("strokeAlign" in node) {
     styles.strokeAlign = node.strokeAlign as string;
   }
@@ -275,6 +388,7 @@ const serializeStyles = (node: SerializableNode): SerializedStyles => {
     const effects = node.effects as readonly Effect[];
     if (effects.length > 0) {
       styles.effects = serializeEffects(effects);
+      styles.rawEffects = jsonValue(effects);
     }
   }
 
@@ -353,14 +467,42 @@ const serializeStyles = (node: SerializableNode): SerializedStyles => {
  */
 export type SerializableNode = SceneNode | PageNode;
 
-export const serializeNode = (node: SerializableNode): SerializedNode => {
+export const serializeNode = (
+  node: SerializableNode,
+  options: { depth?: number; includeHidden?: boolean } = {}
+): SerializedNode => {
   const base: SerializedNode = {
     id: node.id,
     name: node.name,
     type: node.type,
     bounds: getBounds(node),
     styles: serializeStyles(node),
+    details: properties(node, [
+      "parentId",
+      "absoluteTransform",
+      "relativeTransform",
+      "absoluteBoundingBox",
+      "absoluteRenderBounds",
+      "boundVariables",
+      "explicitVariableModes",
+      "resolvedVariableModes",
+      "fillStyleId",
+      "strokeStyleId",
+      "effectStyleId",
+      "textStyleId",
+      "exportSettings",
+      "isMask",
+      "maskType",
+      "componentProperties",
+      "variantProperties",
+      "description",
+      "descriptionMarkdown",
+      "documentationLinks",
+      "key",
+      "remote",
+    ]),
   };
+  base.details!.parentId = node.parent?.id;
 
   // Handle Figma TEXT nodes and FigJam STICKY / SHAPE_WITH_TEXT nodes (which
   // expose their label through a `.text` sublayer).
@@ -380,11 +522,20 @@ export const serializeNode = (node: SerializableNode): SerializedNode => {
   }
 
   if ("children" in node) {
+    const children = node.children.filter(
+      (child) => options.includeHidden || child.visible !== false
+    );
+    if (options.depth !== undefined && options.depth <= 0) {
+      return { ...base, childCount: children.length };
+    }
     return {
       ...base,
-      children: node.children
-        .filter((child) => child.visible !== false)
-        .map((child) => serializeNode(child)),
+      children: children.map((child) =>
+        serializeNode(child, {
+          ...options,
+          depth: options.depth === undefined ? undefined : options.depth - 1,
+        })
+      ),
     };
   }
 

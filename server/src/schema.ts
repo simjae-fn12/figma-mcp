@@ -932,10 +932,35 @@ export const toolInputSchemas = {
   }),
 
   get_design_context: z.object({
+    nodeId: createFigmaNodeIdSchema()
+      .optional()
+      .describe(
+        "Exact root node ID; avoids changing selection. Defaults to selection/current page."
+      ),
     depth: z
       .number()
+      .int()
+      .min(0)
+      .max(100)
       .optional()
-      .describe("How many levels deep to traverse the node tree (default 2)"),
+      .describe("Maximum child depth: default 20 for nodeId, otherwise 2. Truncation is reported."),
+    maxNodes: z
+      .number()
+      .int()
+      .min(1)
+      .max(10000)
+      .optional()
+      .describe("Node budget, default 2000. Truncation is reported."),
+    includeHidden: z
+      .boolean()
+      .optional()
+      .describe("Include hidden nodes and their descendants, default false."),
+    includeCss: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include Figma CSS for each node, default true. Source measurements remain authoritative."
+      ),
     fileKey: fileKeyField,
   }),
 
@@ -943,6 +968,24 @@ export const toolInputSchemas = {
     fileKey: fileKeyField,
   }),
 
+  get_image: z.object({
+    imageHash: z.string().min(1).max(256),
+    fileKey: fileKeyField,
+  }),
+  save_image: z.object({
+    imageHash: z
+      .string()
+      .min(1)
+      .max(256)
+      .describe("Image fill hash; exports original bytes without cropping/effects."),
+    outputPath: z
+      .string()
+      .min(1)
+      .describe(
+        "New file inside the MCP server working directory. Never overwrites existing files."
+      ),
+    fileKey: fileKeyField,
+  }),
   get_screenshot: z.object({
     nodeIds: z
       .array(createFigmaNodeIdSchema())
@@ -953,7 +996,13 @@ export const toolInputSchemas = {
     format: createExportFormatSchema()
       .optional()
       .describe("Export format: PNG (default) or SVG or JPG or PDF"),
-    scale: z.number().optional().describe("Export scale for raster formats (default 2)"),
+    scale: z
+      .number()
+      .positive()
+      .finite()
+      .max(16)
+      .optional()
+      .describe("Export scale for raster formats (default 2)"),
     clip: z
       .boolean()
       .optional()
@@ -1273,8 +1322,10 @@ const rpcToArgs: Record<
   trace_prototype_flow: (nodeIds, params) => ({ ...params, nodeId: nodeIds?.[0] }),
   get_styles: (_nodeIds, params) => ({ ...params }),
   get_metadata: (_nodeIds, params) => ({ ...params }),
-  get_design_context: (_nodeIds, params) => ({ ...params }),
+  get_design_context: (nodeIds, params) => ({ ...params, nodeId: nodeIds?.[0] }),
   get_variable_defs: (_nodeIds, params) => ({ ...params }),
+  get_image: (_nodeIds, params) => ({ ...params }),
+  save_image: (_nodeIds, params) => ({ ...params }),
   get_screenshot: (nodeIds, params) => ({ nodeIds, ...params }),
   set_node_visibility: (_nodeIds, params) => ({ ...params }),
   set_text_content: (nodeIds, params) => ({ ...params, nodeId: nodeIds?.[0] }),
@@ -1357,6 +1408,9 @@ export function validateRpc(
   nodeIds?: string[],
   params?: Record<string, unknown>
 ): RpcValidation {
+  // Versioned internal operation avoids v0.0.24 leaders stripping new context
+  // options when an upgraded MCP client is a follower of an older process.
+  if (tool === "get_precision_context") tool = "get_design_context";
   if (!(tool in rpcInputSchemas)) return { error: null };
 
   const name = tool as ToolName;

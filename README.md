@@ -1,5 +1,21 @@
 # Figma MCP Bridge
 
+## Local precision build (0.0.24-precision.1)
+
+This local fork adds design-to-web data fidelity; it is not a replacement for every official Figma service (Code Connect and generative tools are outside scope).
+
+- `get_node` preserves per-side borders, mixed text ranges (UTF-16 indices), exact paint RGB, variable bindings, transforms, layout sizing/min/max constraints and text style IDs. Existing fields remain compatible.
+- `get_design_context({nodeId, depth:20, maxNodes:2000})` targets a specific node without changing selection. It returns source properties, Figma CSS, consumer-resolved variables, main-component documentation, and SVG/image-fill candidates. Check `truncated`, `omittedNodeIds`, and `warnings` before implementing. CSS is supplemental and does not substitute for source measurements or screenshot verification.
+- `save_screenshots` exports PNG/JPG references or SVG/PDF assets to new workspace files. PNG results include actual pixel dimensions and SHA-256. `save_image({imageHash,outputPath})` saves original image bytes, without the node's crop or effects; preserve those from the source paint properties.
+- Exports are limited to 32 million raster pixels and 32 MiB per transfer. Pending identical exports are deduplicated and a 30-second timeout reports a failure without substituting an image. Figma's underlying export operation cannot be cancelled by this plugin.
+- SVG candidates include nested nodes; choose the asset root intentionally instead of exporting/rendering every candidate. Hidden nodes are excluded unless requested. Separate data and screenshot calls are not atomic.
+
+Build: `npm ci --prefix server && npm ci --prefix plugin`, then `npm run build --prefix server`, `npm run typecheck --prefix plugin`, and `npm run build --prefix plugin`.
+Regression tests: `node --test server/test/precision.test.mjs` (run from this checkout).
+After updating the registered plugin's `dist` files, close/reopen the development plugin. Restart/reload the MCP server to expose the extended tool schema. `get_metadata.bridgeBuild` identifies the running plugin build.
+
+The original release ZIP and backup remain alongside this checkout. Do not install npm updates over the patched package without rebuilding/reapplying this fork.
+
 [![Pairing with Hopp](https://gethopp.app/git/hopp-shield.svg?ref=hopp-repo)](https://gethopp.app)
 
 - [Demo](#demo)

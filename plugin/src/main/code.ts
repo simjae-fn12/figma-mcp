@@ -1,4 +1,6 @@
 import { serializeNode } from "./serializer";
+import { designContext } from "./design-context";
+import { exportNode, withTimeout } from "./export";
 import type { SerializableNode } from "./serializer";
 import { addLayersToFrame } from "../html-figma/figma";
 import { getPrototypeConnections, scanPrototype, tracePrototypeFlow } from "./prototype";
@@ -13,8 +15,10 @@ type RequestType =
   | "get_styles"
   | "get_metadata"
   | "get_design_context"
+  | "get_precision_context"
   | "get_variable_defs"
   | "get_screenshot"
+  | "get_image"
   | "set_node_visibility"
   | "set_text_content"
   | "set_text_properties"
@@ -662,6 +666,15 @@ const handleRequest = async (request: ServerRequest): Promise<PluginResponse> =>
           type: request.type,
           requestId: request.requestId,
           data: {
+            bridgeBuild: "0.0.24-precision.1",
+            capabilities: [
+              "per-side-strokes",
+              "text-segments",
+              "node-design-context",
+              "consumer-variables",
+              "original-images",
+              "bounded-exports",
+            ],
             editorType: figma.editorType,
             fileName: figma.root.name,
             currentPageId: figma.currentPage.id,
@@ -674,60 +687,34 @@ const handleRequest = async (request: ServerRequest): Promise<PluginResponse> =>
           },
         };
       }
+      case "get_precision_context":
       case "get_design_context": {
-        const depth = typeof request.params?.depth === "number" ? request.params.depth : 2;
-        const serializeWithDepth = async (
-          node: SerializableNode,
-          currentDepth: number
-        ): Promise<ReturnType<typeof serializeNode>> => {
-          const serialized = serializeNode(node);
-          if (currentDepth >= depth && serialized.children) {
-            // Truncate children at depth limit, but show count
-            return {
-              ...serialized,
-              children: undefined,
-              childCount:
-                (node as ChildrenMixin & SceneNode).children?.filter((c) => c.visible !== false)
-                  .length ?? 0,
-            } as ReturnType<typeof serializeNode> & { childCount: number };
-          }
-          if (serialized.children) {
-            const childNodes = await Promise.all(
-              serialized.children.map((child) => figma.getNodeByIdAsync(child.id))
-            );
-            const serializedChildren = await Promise.all(
-              childNodes
-                .filter(
-                  (n): n is SceneNode =>
-                    n !== null && n.type !== "DOCUMENT" && "visible" in n && n.visible !== false
-                )
-                .map((n) => serializeWithDepth(n, currentDepth + 1))
-            );
-            return {
-              ...serialized,
-              children: serializedChildren,
-            };
-          }
-          return serialized;
-        };
-
+        const params = request.params ?? {};
+        const nodeId = request.nodeIds?.[0];
+        const target = nodeId ? await figma.getNodeByIdAsync(nodeId) : undefined;
+        if (nodeId && (!target || target.type === "DOCUMENT"))
+          throw new Error(`Node not found: ${nodeId}`);
         const selection = figma.currentPage.selection;
-        const contextNodes =
-          selection.length > 0
-            ? await Promise.all(selection.map((node) => serializeWithDepth(node, 0)))
-            : [await serializeWithDepth(figma.currentPage, 0)];
-
+        const roots: SerializableNode[] =
+          target && target.type !== "DOCUMENT"
+            ? [target]
+            : selection.length
+              ? [...selection]
+              : [figma.currentPage];
+        const data = await designContext(roots, {
+          depth: typeof params.depth === "number" ? params.depth : nodeId ? 20 : 2,
+          maxNodes: typeof params.maxNodes === "number" ? params.maxNodes : 2000,
+          includeHidden: params.includeHidden === true,
+          includeCss: params.includeCss !== false,
+        });
         return {
           type: request.type,
           requestId: request.requestId,
           data: {
+            ...data,
             fileName: figma.root.name,
-            currentPage: {
-              id: figma.currentPage.id,
-              name: figma.currentPage.name,
-            },
+            currentPage: { id: figma.currentPage.id, name: figma.currentPage.name },
             selectionCount: selection.length,
-            context: contextNodes,
           },
         };
       }
@@ -820,6 +807,25 @@ const handleRequest = async (request: ServerRequest): Promise<PluginResponse> =>
           },
         };
       }
+      case "get_image": {
+        const hash = String(request.params?.imageHash ?? "");
+        const image = figma.getImageByHash(hash);
+        if (!image) throw new Error(`Image not found: ${hash}`);
+        const bytes = await withTimeout(image.getBytesAsync(), `Image ${hash}`);
+        if (!bytes.length || bytes.length > 32 * 1024 * 1024)
+          throw new Error("Image must contain 1 byte to 32 MiB");
+        const size = await withTimeout(image.getSizeAsync(), `Image size ${hash}`);
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            imageHash: hash,
+            base64: figma.base64Encode(bytes),
+            ...size,
+            bytes: bytes.length,
+          },
+        };
+      }
       case "get_screenshot": {
         const format =
           request.params?.format === "SVG" ||
@@ -847,38 +853,47 @@ const handleRequest = async (request: ServerRequest): Promise<PluginResponse> =>
           throw new Error("No nodes to export. Select nodes or provide nodeIds.");
         }
 
-        const exports = await Promise.all(
-          targetNodes.map(async (node) => {
-            const commonSettings = clip ? { contentsOnly: true, useAbsoluteBounds: true } : {};
-            const settings: ExportSettings =
-              format === "SVG"
-                ? { format: "SVG", ...commonSettings }
-                : format === "PDF"
-                  ? { format: "PDF", ...commonSettings }
-                  : format === "JPG"
-                    ? {
-                        format: "JPG",
-                        constraint: { type: "SCALE", value: scale },
-                        ...commonSettings,
-                      }
-                    : {
-                        format: "PNG",
-                        constraint: { type: "SCALE", value: scale },
-                        ...commonSettings,
-                      };
+        const exports = [];
+        for (const node of targetNodes) {
+          const commonSettings = clip ? { contentsOnly: true, useAbsoluteBounds: true } : {};
+          const settings: ExportSettings =
+            format === "SVG"
+              ? { format: "SVG", ...commonSettings }
+              : format === "PDF"
+                ? { format: "PDF", ...commonSettings }
+                : format === "JPG"
+                  ? {
+                      format: "JPG",
+                      constraint: { type: "SCALE", value: scale },
+                      ...commonSettings,
+                    }
+                  : {
+                      format: "PNG",
+                      constraint: { type: "SCALE", value: scale },
+                      ...commonSettings,
+                    };
 
-            const bytes = await node.exportAsync(settings);
-            const base64 = figma.base64Encode(bytes);
-            return {
-              nodeId: node.id,
-              nodeName: node.name,
-              format,
-              base64,
-              width: node.width,
-              height: node.height,
-            };
-          })
-        );
+          const bytes = await exportNode(node, settings);
+          const base64 = figma.base64Encode(bytes);
+          exports.push({
+            nodeId: node.id,
+            nodeName: node.name,
+            format,
+            base64,
+            width: node.width,
+            height: node.height,
+            scale: format === "PNG" || format === "JPG" ? scale : undefined,
+            bytes: bytes.length,
+            pixelWidth:
+              format === "PNG" && bytes.length >= 24
+                ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(16)
+                : undefined,
+            pixelHeight:
+              format === "PNG" && bytes.length >= 24
+                ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(20)
+                : undefined,
+          });
+        }
 
         return {
           type: request.type,
