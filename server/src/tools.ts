@@ -33,6 +33,9 @@ import {
   scrollAndZoomIntoViewInput,
   groupNodesInput,
   ungroupNodeInput,
+  createComponentInput,
+  createInstanceInput,
+  combineAsVariantsInput,
   setTextPropertiesShape,
   setTextPropertiesInput,
   createConnectorBase,
@@ -691,6 +694,45 @@ export function registerTools(server: McpServer, node: Node, port: number): void
     async ({ nodeId, fileKey }): Promise<ToolResult> => {
       return renderResponse(() =>
         node.sendWithParams("ungroup_node", [nodeId], undefined, fileKey)
+      );
+    }
+  );
+
+  server.tool(
+    "create_component",
+    "Convert one or more existing nodes (frames, groups, shapes, text) into main components — the API equivalent of Figma's Create component. Each node is replaced in place by a COMPONENT with the same contents and position; node IDs change, so use the returned mapping. Figma design editor only. When multiple files are connected, specify fileKey.",
+    createComponentInput.shape,
+    async (args): Promise<ToolResult> => {
+      const parsed = parseToolInput(toolInputSchemas.create_component, args);
+      if (!parsed.success) return parsed.error;
+      const { nodeIds, fileKey, ...params } = parsed.data;
+      return renderResponse(() =>
+        node.sendWithParams("create_component", nodeIds, params, fileKey)
+      );
+    }
+  );
+
+  server.tool(
+    "create_instance",
+    "Create an instance of a main component. Place it via parentId/x/y, or pass replaceNodeId to swap an existing node (e.g. a hand-built duplicate) for the instance at the same parent, layer order and position — the replaced node is deleted. Instance sublayers can then be edited with their I-prefixed IDs (e.g. set_text_content). Figma design editor only. When multiple files are connected, specify fileKey.",
+    createInstanceInput.shape,
+    async (args): Promise<ToolResult> => {
+      const parsed = parseToolInput(toolInputSchemas.create_instance, args);
+      if (!parsed.success) return parsed.error;
+      const { fileKey, ...params } = parsed.data;
+      return renderResponse(() =>
+        node.sendWithParams("create_instance", undefined, params, fileKey)
+      );
+    }
+  );
+
+  server.tool(
+    "combine_as_variants",
+    "Combine COMPONENT nodes into a single component set (variants). Variant properties come from component names in 'Prop=Value, Prop2=Value' form, so rename the components first. Figma design editor only. When multiple files are connected, specify fileKey.",
+    combineAsVariantsInput.shape,
+    async ({ nodeIds, fileKey, ...params }): Promise<ToolResult> => {
+      return renderResponse(() =>
+        node.sendWithParams("combine_as_variants", nodeIds, params, fileKey)
       );
     }
   );

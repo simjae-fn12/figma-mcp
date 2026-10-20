@@ -325,6 +325,50 @@ export const groupNodesInput = z.object({
   fileKey: fileKeyField,
 });
 
+export const createComponentInput = z.object({
+  nodeIds: z
+    .array(createFigmaNodeIdSchema())
+    .min(1)
+    .describe(
+      "Nodes to convert into main components, one component per node. Each node is replaced in place by a component with the same contents and position, so its node ID changes."
+    ),
+  name: z
+    .string()
+    .optional()
+    .describe("Optional component name; only allowed when converting a single node"),
+  fileKey: fileKeyField,
+});
+
+export const createInstanceInput = z.object({
+  componentId: createFigmaNodeIdSchema().describe("Main component (COMPONENT node) to instantiate"),
+  replaceNodeId: createFigmaNodeIdSchema()
+    .optional()
+    .describe(
+      "Optional node to swap out: the instance takes its parent, layer order, and x/y, and the node is deleted. Cannot be combined with parentId."
+    ),
+  parentId: createFigmaNodeIdSchema()
+    .optional()
+    .describe("Optional parent node ID to append the instance into"),
+  x: z.number().optional().describe("Optional x position"),
+  y: z.number().optional().describe("Optional y position"),
+  name: z.string().optional().describe("Optional instance name"),
+  fileKey: fileKeyField,
+});
+
+export const combineAsVariantsInput = z.object({
+  nodeIds: z
+    .array(createFigmaNodeIdSchema())
+    .min(1)
+    .describe(
+      "COMPONENT nodes to combine into one component set. Name them 'Prop=Value, Prop2=Value' first to define variant properties."
+    ),
+  parentId: createFigmaNodeIdSchema()
+    .optional()
+    .describe("Optional parent for the component set. Defaults to the first component's parent."),
+  name: z.string().optional().describe("Optional component set name"),
+  fileKey: fileKeyField,
+});
+
 export const ungroupNodeInput = z.object({
   nodeId: createFigmaNodeIdSchema().describe(
     "Group or frame to ungroup. Children move up to its parent and the wrapper is removed."
@@ -1131,6 +1175,18 @@ export const toolInputSchemas = {
 
   ungroup_node: ungroupNodeInput,
 
+  create_component: createComponentInput.refine(
+    (value) => value.name === undefined || value.nodeIds.length === 1,
+    "name can only be set when converting a single node"
+  ),
+
+  create_instance: createInstanceInput.refine(
+    (value) => value.replaceNodeId === undefined || value.parentId === undefined,
+    "replaceNodeId and parentId cannot be combined"
+  ),
+
+  combine_as_variants: combineAsVariantsInput,
+
   set_selection: setSelectionInput,
 
   scroll_and_zoom_into_view: scrollAndZoomIntoViewInput,
@@ -1364,6 +1420,9 @@ const rpcToArgs: Record<
   reparent_nodes: (nodeIds, params) => ({ nodeIds, ...params }),
   group_nodes: (nodeIds, params) => ({ nodeIds, ...params }),
   ungroup_node: (nodeIds, params) => ({ nodeId: nodeIds?.[0], ...params }),
+  create_component: (nodeIds, params) => ({ nodeIds, ...params }),
+  create_instance: (_nodeIds, params) => ({ ...params }),
+  combine_as_variants: (nodeIds, params) => ({ nodeIds, ...params }),
   set_selection: (nodeIds, params) => ({ nodeIds, ...params }),
   scroll_and_zoom_into_view: (nodeIds, params) => ({ nodeIds, ...params }),
   delete_nodes: (nodeIds, params) => ({ nodeIds, ...params }),

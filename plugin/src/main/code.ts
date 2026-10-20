@@ -50,6 +50,9 @@ type RequestType =
   | "reparent_nodes"
   | "group_nodes"
   | "ungroup_node"
+  | "create_component"
+  | "create_instance"
+  | "combine_as_variants"
   | "set_selection"
   | "scroll_and_zoom_into_view"
   | "delete_nodes"
@@ -425,6 +428,9 @@ const EDIT_REQUEST_TYPES = new Set<RequestType>([
   "reparent_nodes",
   "group_nodes",
   "ungroup_node",
+  "create_component",
+  "create_instance",
+  "combine_as_variants",
   "delete_nodes",
   "apply_animation_style",
   "remove_animation_style",
@@ -2497,6 +2503,152 @@ const handleRequest = async (request: ServerRequest): Promise<PluginResponse> =>
           data: {
             parentId,
             orphanIds: orphans.map((o) => o.id),
+          },
+        };
+      }
+      case "create_component": {
+        if (isFigJam()) {
+          throw new Error("create_component is not available in FigJam");
+        }
+        if (!request.nodeIds || request.nodeIds.length === 0) {
+          throw new Error("nodeIds is required for create_component");
+        }
+
+        const nodes = await Promise.all(request.nodeIds.map((nodeId) => getSceneNodeById(nodeId)));
+        const components = [];
+        for (const node of nodes) {
+          // createComponentFromNode replaces the node in place and gives the
+          // component a new ID, so report the mapping back to the caller.
+          const sourceNodeId = node.id;
+          const component = figma.createComponentFromNode(node);
+          const name = request.params?.name;
+          if (typeof name === "string") {
+            component.name = name;
+          }
+          components.push({
+            sourceNodeId,
+            nodeId: component.id,
+            nodeName: component.name,
+            parentId: component.parent?.id,
+            key: component.key,
+          });
+        }
+
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            createdCount: components.length,
+            components,
+          },
+        };
+      }
+      case "create_instance": {
+        if (isFigJam()) {
+          throw new Error("create_instance is not available in FigJam");
+        }
+        const params = request.params ?? {};
+        if (typeof params.componentId !== "string") {
+          throw new Error("componentId is required for create_instance");
+        }
+        const component = await figma.getNodeByIdAsync(params.componentId);
+        if (!component || component.type !== "COMPONENT") {
+          throw new Error(
+            `componentId must be a COMPONENT node (got ${component?.type ?? "nothing"}: ${params.componentId})`
+          );
+        }
+
+        // Resolve the swap target first so a bad ID doesn't leave a stray instance.
+        const target =
+          typeof params.replaceNodeId === "string"
+            ? await getSceneNodeById(params.replaceNodeId)
+            : undefined;
+        const targetParent = target?.parent;
+        if (target && (!targetParent || !supportsChildren(targetParent))) {
+          throw new Error(`Node to replace has no usable parent: ${target.id}`);
+        }
+
+        const instance = component.createInstance();
+        if (typeof params.name === "string") {
+          instance.name = params.name;
+        }
+
+        let replacedNodeId: string | undefined;
+        if (target && targetParent && supportsChildren(targetParent)) {
+          const parent = targetParent;
+          parent.insertChild(parent.children.indexOf(target), instance);
+          if ("x" in target && "y" in target) {
+            instance.x = target.x;
+            instance.y = target.y;
+          }
+          replacedNodeId = target.id;
+          target.remove();
+        } else {
+          await appendToParentIfProvided(instance, params.parentId);
+        }
+        positionNode(instance, params.x, params.y);
+
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            nodeId: instance.id,
+            nodeName: instance.name,
+            componentId: component.id,
+            parentId: instance.parent?.id,
+            ...(replacedNodeId ? { replacedNodeId } : {}),
+            x: instance.x,
+            y: instance.y,
+            width: instance.width,
+            height: instance.height,
+          },
+        };
+      }
+      case "combine_as_variants": {
+        if (isFigJam()) {
+          throw new Error("combine_as_variants is not available in FigJam");
+        }
+        if (!request.nodeIds || request.nodeIds.length === 0) {
+          throw new Error("nodeIds is required for combine_as_variants");
+        }
+
+        const nodes = await Promise.all(request.nodeIds.map((nodeId) => getSceneNodeById(nodeId)));
+        const components = nodes.map((node) => {
+          if (node.type !== "COMPONENT") {
+            throw new Error(
+              `combine_as_variants only accepts COMPONENT nodes, got ${node.type}: ${node.id}`
+            );
+          }
+          return node;
+        });
+
+        const explicitParentId = request.params?.parentId;
+        let parent: BaseNode & ChildrenMixin;
+        if (typeof explicitParentId === "string") {
+          parent = await getParentNodeById(explicitParentId);
+        } else {
+          const firstParent = components[0].parent;
+          if (!firstParent || !supportsChildren(firstParent)) {
+            throw new Error("First component has no parent that supports children");
+          }
+          parent = firstParent;
+        }
+
+        const componentSet = figma.combineAsVariants(components, parent);
+        const name = request.params?.name;
+        if (typeof name === "string") {
+          componentSet.name = name;
+        }
+
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            nodeId: componentSet.id,
+            nodeName: componentSet.name,
+            parentId: componentSet.parent?.id,
+            variantIds: componentSet.children.map((c) => c.id),
+            componentPropertyDefinitions: componentSet.componentPropertyDefinitions,
           },
         };
       }
